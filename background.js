@@ -11,8 +11,20 @@ const HUMAN_STEP_DELAY_MAX = 2200;
 initializeSessionStorageAccess();
 
 // ============================================================
-// State Management (chrome.storage.session)
+// State Management (chrome.storage.session + chrome.storage.local)
 // ============================================================
+
+const PERSISTED_SETTING_DEFAULTS = {
+  vpsUrl: '',
+  vpsPassword: '',
+  customPassword: '',
+  autoRunSkipFailures: false,
+  mailProvider: '163',
+  inbucketHost: '',
+  inbucketMailbox: '',
+};
+
+const PERSISTED_SETTING_KEYS = Object.keys(PERSISTED_SETTING_DEFAULTS);
 
 const DEFAULT_STATE = {
   currentStep: 0,
@@ -32,23 +44,29 @@ const DEFAULT_STATE = {
   tabRegistry: {},
   sourceLastUrls: {},
   logs: [],
-  vpsUrl: '',
-  vpsPassword: '',
-  customPassword: '',
-  autoRunSkipFailures: false,
+  ...PERSISTED_SETTING_DEFAULTS,
   autoRunning: false,
   autoRunPhase: 'idle',
   autoRunCurrentRun: 0,
   autoRunTotalRuns: 1,
   autoRunAttemptRun: 0,
-  mailProvider: '163', // 'qq' or '163'
-  inbucketHost: '',
-  inbucketMailbox: '',
 };
 
+async function getPersistedSettings() {
+  const stored = await chrome.storage.local.get(PERSISTED_SETTING_KEYS);
+  return {
+    ...PERSISTED_SETTING_DEFAULTS,
+    ...stored,
+    autoRunSkipFailures: Boolean(stored.autoRunSkipFailures ?? PERSISTED_SETTING_DEFAULTS.autoRunSkipFailures),
+  };
+}
+
 async function getState() {
-  const state = await chrome.storage.session.get(null);
-  return { ...DEFAULT_STATE, ...state };
+  const [state, persistedSettings] = await Promise.all([
+    chrome.storage.session.get(null),
+    getPersistedSettings(),
+  ]);
+  return { ...DEFAULT_STATE, ...persistedSettings, ...state };
 }
 
 async function initializeSessionStorageAccess() {
@@ -67,6 +85,21 @@ async function initializeSessionStorageAccess() {
 async function setState(updates) {
   console.log(LOG_PREFIX, 'storage.set:', JSON.stringify(updates).slice(0, 200));
   await chrome.storage.session.set(updates);
+}
+
+async function setPersistentSettings(updates) {
+  const persistedUpdates = {};
+  for (const key of PERSISTED_SETTING_KEYS) {
+    if (updates[key] !== undefined) {
+      persistedUpdates[key] = key === 'autoRunSkipFailures'
+        ? Boolean(updates[key])
+        : updates[key];
+    }
+  }
+
+  if (Object.keys(persistedUpdates).length > 0) {
+    await chrome.storage.local.set(persistedUpdates);
+  }
 }
 
 function broadcastDataUpdate(payload) {
@@ -89,35 +122,25 @@ async function setPasswordState(password) {
 async function resetState() {
   console.log(LOG_PREFIX, 'Resetting all state');
   // Preserve settings and persistent data across resets
-  const prev = await chrome.storage.session.get([
-    'seenCodes',
-    'seenInbucketMailIds',
-    'accounts',
-    'tabRegistry',
-    'sourceLastUrls',
-    'vpsUrl',
-    'vpsPassword',
-    'customPassword',
-    'autoRunSkipFailures',
-    'mailProvider',
-    'inbucketHost',
-    'inbucketMailbox',
+  const [prev, persistedSettings] = await Promise.all([
+    chrome.storage.session.get([
+      'seenCodes',
+      'seenInbucketMailIds',
+      'accounts',
+      'tabRegistry',
+      'sourceLastUrls',
+    ]),
+    getPersistedSettings(),
   ]);
   await chrome.storage.session.clear();
   await chrome.storage.session.set({
     ...DEFAULT_STATE,
+    ...persistedSettings,
     seenCodes: prev.seenCodes || [],
     seenInbucketMailIds: prev.seenInbucketMailIds || [],
     accounts: prev.accounts || [],
     tabRegistry: prev.tabRegistry || {},
     sourceLastUrls: prev.sourceLastUrls || {},
-    vpsUrl: prev.vpsUrl || '',
-    vpsPassword: prev.vpsPassword || '',
-    customPassword: prev.customPassword || '',
-    autoRunSkipFailures: Boolean(prev.autoRunSkipFailures),
-    mailProvider: prev.mailProvider || '163',
-    inbucketHost: prev.inbucketHost || '',
-    inbucketMailbox: prev.inbucketMailbox || '',
   });
 }
 
@@ -915,6 +938,7 @@ async function handleMessage(message, sender) {
       if (message.payload.mailProvider !== undefined) updates.mailProvider = message.payload.mailProvider;
       if (message.payload.inbucketHost !== undefined) updates.inbucketHost = message.payload.inbucketHost;
       if (message.payload.inbucketMailbox !== undefined) updates.inbucketMailbox = message.payload.inbucketMailbox;
+      await setPersistentSettings(updates);
       await setState(updates);
       return { ok: true };
     }

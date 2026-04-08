@@ -18,6 +18,7 @@ const inputEmail = document.getElementById('input-email');
 const inputPassword = document.getElementById('input-password');
 const btnFetchEmail = document.getElementById('btn-fetch-email');
 const btnTogglePassword = document.getElementById('btn-toggle-password');
+const btnSaveSettings = document.getElementById('btn-save-settings');
 const btnStop = document.getElementById('btn-stop');
 const btnReset = document.getElementById('btn-reset');
 const stepsProgress = document.getElementById('steps-progress');
@@ -55,6 +56,12 @@ let currentAutoRun = {
   totalRuns: 1,
   attemptRun: 0,
 };
+let settingsDirty = false;
+let settingsSaveInFlight = false;
+let settingsAutoSaveTimer = null;
+
+const EYE_OPEN_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>';
+const EYE_CLOSED_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.94 10.94 0 0 1 12 19C5 19 1 12 1 12a21.77 21.77 0 0 1 5.06-6.94"/><path d="M9.9 4.24A10.94 10.94 0 0 1 12 5c7 0 11 7 11 7a21.86 21.86 0 0 1-2.16 3.19"/><path d="M1 1l22 22"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/></svg>';
 
 // ============================================================
 // Toast Notifications
@@ -152,6 +159,77 @@ function setDefaultAutoRunButton() {
   btnAutoRun.disabled = false;
   inputRunCount.disabled = false;
   btnAutoRun.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg> 自动';
+}
+
+function collectSettingsPayload() {
+  return {
+    vpsUrl: inputVpsUrl.value.trim(),
+    vpsPassword: inputVpsPassword.value,
+    customPassword: inputPassword.value,
+    mailProvider: selectMailProvider.value,
+    inbucketHost: inputInbucketHost.value.trim(),
+    inbucketMailbox: inputInbucketMailbox.value.trim(),
+    autoRunSkipFailures: inputAutoSkipFailures.checked,
+  };
+}
+
+function markSettingsDirty(isDirty = true) {
+  settingsDirty = isDirty;
+  updateSaveButtonState();
+}
+
+function updateSaveButtonState() {
+  btnSaveSettings.disabled = settingsSaveInFlight || !settingsDirty;
+  btnSaveSettings.textContent = settingsSaveInFlight ? '保存中' : '保存';
+}
+
+function scheduleSettingsAutoSave() {
+  clearTimeout(settingsAutoSaveTimer);
+  settingsAutoSaveTimer = setTimeout(() => {
+    saveSettings({ silent: true }).catch(() => {});
+  }, 500);
+}
+
+async function saveSettings(options = {}) {
+  const { silent = false } = options;
+  clearTimeout(settingsAutoSaveTimer);
+
+  if (!settingsDirty && !settingsSaveInFlight && silent) {
+    return;
+  }
+
+  const payload = collectSettingsPayload();
+  settingsSaveInFlight = true;
+  updateSaveButtonState();
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: 'SAVE_SETTING',
+      source: 'sidepanel',
+      payload,
+    });
+
+    if (response?.error) {
+      throw new Error(response.error);
+    }
+
+    syncLatestState(payload);
+    markSettingsDirty(false);
+    updateMailProviderUI();
+    updateButtonStates();
+    if (!silent) {
+      showToast('配置已保存', 'success', 1800);
+    }
+  } catch (err) {
+    markSettingsDirty(true);
+    if (!silent) {
+      showToast(`保存失败：${err.message}`, 'error');
+    }
+    throw err;
+  } finally {
+    settingsSaveInFlight = false;
+    updateSaveButtonState();
+  }
 }
 
 function applyAutoRunStatus(payload = currentAutoRun) {
@@ -274,6 +352,7 @@ async function restoreState() {
     }
 
     applyAutoRunStatus(state);
+    markSettingsDirty(false);
     updateStatusDisplay(latestState);
     updateProgressCounter();
     updateMailProviderUI();
@@ -503,7 +582,10 @@ async function fetchDuckEmail(options = {}) {
 }
 
 function syncPasswordToggleLabel() {
-  btnTogglePassword.textContent = inputPassword.type === 'password' ? '显示' : '隐藏';
+  const isHidden = inputPassword.type === 'password';
+  btnTogglePassword.innerHTML = isHidden ? EYE_OPEN_ICON : EYE_CLOSED_ICON;
+  btnTogglePassword.setAttribute('aria-label', isHidden ? '显示密码' : '隐藏密码');
+  btnTogglePassword.title = isHidden ? '显示密码' : '隐藏密码';
 }
 
 async function maybeTakeoverAutoRun(actionLabel) {
@@ -606,6 +688,14 @@ btnTogglePassword.addEventListener('click', () => {
   syncPasswordToggleLabel();
 });
 
+btnSaveSettings.addEventListener('click', async () => {
+  if (!settingsDirty) {
+    showToast('配置已是最新', 'info', 1400);
+    return;
+  }
+  await saveSettings({ silent: false }).catch(() => {});
+});
+
 btnStop.addEventListener('click', async () => {
   btnStop.disabled = true;
   await chrome.runtime.sendMessage({ type: 'STOP_FLOW', source: 'sidepanel', payload: {} });
@@ -656,6 +746,7 @@ btnReset.addEventListener('click', async () => {
     document.querySelectorAll('.step-status').forEach(el => el.textContent = '');
     setDefaultAutoRunButton();
     applyAutoRunStatus(currentAutoRun);
+    markSettingsDirty(false);
     updateStopButtonState(false);
     updateButtonStates();
     updateProgressCounter();
@@ -675,61 +766,56 @@ inputEmail.addEventListener('change', async () => {
   }
 });
 inputEmail.addEventListener('input', updateButtonStates);
-inputPassword.addEventListener('input', updateButtonStates);
-
-inputVpsUrl.addEventListener('change', async () => {
-  const vpsUrl = inputVpsUrl.value.trim();
-  if (vpsUrl) {
-    await chrome.runtime.sendMessage({ type: 'SAVE_SETTING', source: 'sidepanel', payload: { vpsUrl } });
-  }
+inputVpsUrl.addEventListener('input', () => {
+  markSettingsDirty(true);
+  scheduleSettingsAutoSave();
+});
+inputVpsUrl.addEventListener('blur', () => {
+  saveSettings({ silent: true }).catch(() => {});
 });
 
-inputVpsPassword.addEventListener('change', async () => {
-  await chrome.runtime.sendMessage({
-    type: 'SAVE_SETTING',
-    source: 'sidepanel',
-    payload: { vpsPassword: inputVpsPassword.value },
-  });
+inputVpsPassword.addEventListener('input', () => {
+  markSettingsDirty(true);
+  scheduleSettingsAutoSave();
+});
+inputVpsPassword.addEventListener('blur', () => {
+  saveSettings({ silent: true }).catch(() => {});
 });
 
-inputPassword.addEventListener('change', async () => {
-  await chrome.runtime.sendMessage({
-    type: 'SAVE_SETTING',
-    source: 'sidepanel',
-    payload: { customPassword: inputPassword.value },
-  });
+inputPassword.addEventListener('input', () => {
+  markSettingsDirty(true);
+  updateButtonStates();
+  scheduleSettingsAutoSave();
+});
+inputPassword.addEventListener('blur', () => {
+  saveSettings({ silent: true }).catch(() => {});
 });
 
-selectMailProvider.addEventListener('change', async () => {
+selectMailProvider.addEventListener('change', () => {
   updateMailProviderUI();
-  await chrome.runtime.sendMessage({
-    type: 'SAVE_SETTING', source: 'sidepanel',
-    payload: { mailProvider: selectMailProvider.value },
-  });
+  markSettingsDirty(true);
+  saveSettings({ silent: true }).catch(() => {});
 });
 
-inputInbucketMailbox.addEventListener('change', async () => {
-  await chrome.runtime.sendMessage({
-    type: 'SAVE_SETTING',
-    source: 'sidepanel',
-    payload: { inbucketMailbox: inputInbucketMailbox.value.trim() },
-  });
+inputInbucketMailbox.addEventListener('input', () => {
+  markSettingsDirty(true);
+  scheduleSettingsAutoSave();
+});
+inputInbucketMailbox.addEventListener('blur', () => {
+  saveSettings({ silent: true }).catch(() => {});
 });
 
-inputInbucketHost.addEventListener('change', async () => {
-  await chrome.runtime.sendMessage({
-    type: 'SAVE_SETTING',
-    source: 'sidepanel',
-    payload: { inbucketHost: inputInbucketHost.value.trim() },
-  });
+inputInbucketHost.addEventListener('input', () => {
+  markSettingsDirty(true);
+  scheduleSettingsAutoSave();
+});
+inputInbucketHost.addEventListener('blur', () => {
+  saveSettings({ silent: true }).catch(() => {});
 });
 
-inputAutoSkipFailures.addEventListener('change', async () => {
-  await chrome.runtime.sendMessage({
-    type: 'SAVE_SETTING',
-    source: 'sidepanel',
-    payload: { autoRunSkipFailures: inputAutoSkipFailures.checked },
-  });
+inputAutoSkipFailures.addEventListener('change', () => {
+  markSettingsDirty(true);
+  saveSettings({ silent: true }).catch(() => {});
 });
 
 // ============================================================
@@ -861,6 +947,7 @@ btnTheme.addEventListener('click', () => {
 
 initializeManualStepActions();
 initTheme();
+updateSaveButtonState();
 restoreState().then(() => {
   syncPasswordToggleLabel();
   updateButtonStates();

@@ -256,6 +256,14 @@ header {
   min-width: 0;
 }
 
+.input-with-icon {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
 .data-label {
   width: 56px;
   font-size: 11px;
@@ -301,11 +309,36 @@ header {
 .data-input::placeholder { color: var(--text-muted); }
 .data-input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px var(--blue-soft); }
 
+.data-input-with-icon {
+  padding-right: 38px;
+}
+
+.input-icon-btn {
+  position: absolute;
+  right: 8px;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 999px;
+  transition: color var(--transition), background var(--transition);
+}
+.input-icon-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
 #btn-fetch-email {
   padding-inline: 10px;
 }
 
-#btn-toggle-password {
+#btn-save-settings {
   min-width: 58px;
   padding-inline: 10px;
 }

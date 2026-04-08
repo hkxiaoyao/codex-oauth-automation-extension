@@ -78,8 +78,11 @@
       <div class="data-row">
         <span class="data-label">密码</span>
         <div class="data-inline">
-          <input type="password" id="input-password" class="data-input" placeholder="留空则自动生成" />
-          <button id="btn-toggle-password" class="btn btn-outline btn-sm" type="button">显示</button>
+          <div class="input-with-icon">
+            <input type="password" id="input-password" class="data-input data-input-with-icon" placeholder="留空则自动生成" />
+            <button id="btn-toggle-password" class="input-icon-btn" type="button" aria-label="显示密码" title="显示密码"></button>
+          </div>
+          <button id="btn-save-settings" class="btn btn-outline btn-sm" type="button">保存</button>
         </div>
       </div>
       <div class="data-row data-check-row">
