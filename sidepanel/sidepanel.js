@@ -11,6 +11,14 @@ const STATUS_ICONS = {
 };
 
 const logArea = document.getElementById('log-area');
+const updateSection = document.getElementById('update-section');
+const extensionUpdateStatus = document.getElementById('extension-update-status');
+const extensionVersionMeta = document.getElementById('extension-version-meta');
+const btnReleaseLog = document.getElementById('btn-release-log');
+const updateCardVersion = document.getElementById('update-card-version');
+const updateCardSummary = document.getElementById('update-card-summary');
+const updateReleaseList = document.getElementById('update-release-list');
+const btnOpenRelease = document.getElementById('btn-open-release');
 const settingsCard = document.getElementById('settings-card');
 const displayOauthUrl = document.getElementById('display-oauth-url');
 const displayLocalhostUrl = document.getElementById('display-localhost-url');
@@ -73,6 +81,9 @@ const btnDeleteAllHotmailAccounts = document.getElementById('btn-delete-all-hotm
 const btnToggleHotmailList = document.getElementById('btn-toggle-hotmail-list');
 const hotmailListShell = document.getElementById('hotmail-list-shell');
 const hotmailAccountsList = document.getElementById('hotmail-accounts-list');
+const rowEmailPrefix = document.getElementById('row-email-prefix');
+const labelEmailPrefix = document.getElementById('label-email-prefix');
+const inputEmailPrefix = document.getElementById('input-email-prefix');
 const rowInbucketHost = document.getElementById('row-inbucket-host');
 const inputInbucketHost = document.getElementById('input-inbucket-host');
 const rowInbucketMailbox = document.getElementById('row-inbucket-mailbox');
@@ -142,6 +153,7 @@ let hotmailActionInFlight = false;
 let hotmailListExpanded = false;
 let configMenuOpen = false;
 let configActionInFlight = false;
+let currentReleaseSnapshot = null;
 
 const EYE_OPEN_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>';
 const EYE_CLOSED_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.94 10.94 0 0 1 12 19C5 19 1 12 1 12a21.77 21.77 0 0 1 5.06-6.94"/><path d="M9.9 4.24A10.94 10.94 0 0 1 12 5c7 0 11 7 11 7a21.86 21.86 0 0 1-2.16 3.19"/><path d="M1 1l22 22"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/></svg>';
@@ -153,6 +165,7 @@ const filterHotmailAccountsByUsage = window.HotmailUtils?.filterHotmailAccountsB
 const getHotmailBulkActionLabel = window.HotmailUtils?.getHotmailBulkActionLabel;
 const getHotmailListToggleLabel = window.HotmailUtils?.getHotmailListToggleLabel;
 const HOTMAIL_LIST_EXPANDED_STORAGE_KEY = 'multipage-hotmail-list-expanded';
+const sidepanelUpdateService = window.SidepanelUpdateService;
 const MAIL_PROVIDER_LOGIN_CONFIGS = {
   '163': {
     label: '163 邮箱',
@@ -165,6 +178,10 @@ const MAIL_PROVIDER_LOGIN_CONFIGS = {
   qq: {
     label: 'QQ 邮箱',
     url: 'https://wx.mail.qq.com/',
+  },
+  '2925': {
+    label: '2925 邮箱',
+    url: 'https://2925.com/#/mailList',
   },
 };
 
@@ -187,6 +204,10 @@ const LOG_LEVEL_LABELS = {
   warn: '警告',
   error: '错误',
 };
+
+function usesGeneratedAliasMailProvider(provider) {
+  return provider === '2925';
+}
 
 function showToast(message, type = 'error', duration = 4000) {
   const toast = document.createElement('div');
@@ -743,6 +764,7 @@ function collectSettingsPayload() {
     customPassword: inputPassword.value,
     mailProvider: selectMailProvider.value,
     emailGenerator: selectEmailGenerator.value,
+    emailPrefix: inputEmailPrefix.value.trim(),
     inbucketHost: inputInbucketHost.value.trim(),
     inbucketMailbox: inputInbucketMailbox.value.trim(),
     cloudflareDomain: selectedCloudflareDomain,
@@ -890,7 +912,7 @@ function applyAutoRunStatus(payload = currentAutoRun) {
 
   inputRunCount.disabled = currentAutoRun.autoRunning;
   btnAutoRun.disabled = currentAutoRun.autoRunning;
-  btnFetchEmail.disabled = locked;
+  btnFetchEmail.disabled = locked || usesGeneratedAliasMailProvider(selectMailProvider.value);
   inputEmail.disabled = locked;
   inputAutoSkipFailures.disabled = scheduled;
 
@@ -924,7 +946,7 @@ function applyAutoRunStatus(payload = currentAutoRun) {
       setDefaultAutoRunButton();
       inputEmail.disabled = false;
       if (!locked) {
-        btnFetchEmail.disabled = false;
+        btnFetchEmail.disabled = usesGeneratedAliasMailProvider(selectMailProvider.value);
       }
       break;
   }
@@ -987,6 +1009,7 @@ function applySettingsState(state) {
   inputSub2ApiGroup.value = state?.sub2apiGroupName || '';
   selectMailProvider.value = state?.mailProvider || '163';
   selectEmailGenerator.value = state?.emailGenerator || 'duck';
+  inputEmailPrefix.value = state?.emailPrefix || '';
   inputInbucketHost.value = state?.inbucketHost || '';
   inputInbucketMailbox.value = state?.inbucketMailbox || '';
   renderCloudflareDomainOptions(state?.cloudflareDomain || '');
@@ -1041,6 +1064,212 @@ async function restoreState() {
   }
 }
 
+function openExternalUrl(url) {
+  const targetUrl = String(url || '').trim();
+  if (!targetUrl) {
+    return;
+  }
+
+  if (chrome?.tabs?.create) {
+    chrome.tabs.create({ url: targetUrl, active: true }).catch(() => {
+      window.open(targetUrl, '_blank', 'noopener');
+    });
+    return;
+  }
+
+  window.open(targetUrl, '_blank', 'noopener');
+}
+
+function createUpdateNoteList(notes = []) {
+  if (!Array.isArray(notes) || notes.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'update-release-empty';
+    empty.textContent = '该版本未提供可解析的更新说明，请查看完整更新日志。';
+    return empty;
+  }
+
+  const list = document.createElement('ul');
+  list.className = 'update-release-notes';
+
+  notes.forEach((note) => {
+    const item = document.createElement('li');
+    item.textContent = note;
+    list.appendChild(item);
+  });
+
+  return list;
+}
+
+function renderUpdateReleaseList(releases = []) {
+  if (!updateReleaseList) {
+    return;
+  }
+
+  updateReleaseList.innerHTML = '';
+
+  releases.forEach((release) => {
+    const item = document.createElement('article');
+    item.className = 'update-release-item';
+
+    const head = document.createElement('div');
+    head.className = 'update-release-head';
+
+    const titleRow = document.createElement('div');
+    titleRow.className = 'update-release-title-row';
+
+    const version = document.createElement('span');
+    version.className = 'update-release-version';
+    version.textContent = `v${release.version}`;
+    titleRow.appendChild(version);
+
+    if (release.title) {
+      const name = document.createElement('span');
+      name.className = 'update-release-name';
+      name.textContent = release.title;
+      titleRow.appendChild(name);
+    }
+
+    head.appendChild(titleRow);
+
+    const publishedAt = sidepanelUpdateService?.formatReleaseDate?.(release.publishedAt) || '';
+    if (publishedAt) {
+      const date = document.createElement('span');
+      date.className = 'update-release-date';
+      date.textContent = publishedAt;
+      head.appendChild(date);
+    }
+
+    item.appendChild(head);
+    item.appendChild(createUpdateNoteList(release.notes));
+    updateReleaseList.appendChild(item);
+  });
+}
+
+function resetUpdateCard() {
+  if (updateSection) {
+    updateSection.hidden = true;
+  }
+  if (updateCardVersion) {
+    updateCardVersion.textContent = '';
+  }
+  if (updateCardSummary) {
+    updateCardSummary.textContent = '';
+  }
+  if (updateReleaseList) {
+    updateReleaseList.innerHTML = '';
+  }
+  if (btnOpenRelease) {
+    btnOpenRelease.hidden = true;
+    btnOpenRelease.onclick = null;
+  }
+}
+
+function renderReleaseSnapshot(snapshot) {
+  currentReleaseSnapshot = snapshot;
+
+  if (!extensionUpdateStatus || !extensionVersionMeta) {
+    return;
+  }
+
+  extensionUpdateStatus.classList.remove('is-update-available', 'is-check-failed', 'is-version-label');
+
+  const localVersionText = snapshot?.localVersion ? `v${snapshot.localVersion}` : '';
+  const logUrl = snapshot?.logUrl || snapshot?.releasesPageUrl || sidepanelUpdateService?.releasesPageUrl || '';
+
+  if (btnReleaseLog) {
+    btnReleaseLog.onclick = () => openExternalUrl(logUrl);
+    btnReleaseLog.hidden = true;
+  }
+  extensionVersionMeta.hidden = true;
+  extensionVersionMeta.textContent = '';
+
+  switch (snapshot?.status) {
+    case 'update-available': {
+      extensionUpdateStatus.textContent = '有更新';
+      extensionUpdateStatus.classList.add('is-update-available');
+      if (btnReleaseLog) {
+        btnReleaseLog.hidden = false;
+      }
+
+      if (updateSection) {
+        updateSection.hidden = false;
+      }
+      if (updateCardVersion) {
+        updateCardVersion.textContent = `最新版本 v${snapshot.latestVersion}`;
+      }
+      if (updateCardSummary) {
+        const updateCount = Array.isArray(snapshot.newerReleases) ? snapshot.newerReleases.length : 0;
+        updateCardSummary.textContent = updateCount > 1
+          ? `当前 ${localVersionText}，共有 ${updateCount} 个新版本可更新。`
+          : `当前 ${localVersionText}，可更新到 v${snapshot.latestVersion}。`;
+      }
+      renderUpdateReleaseList(snapshot.newerReleases || []);
+      if (btnOpenRelease) {
+        btnOpenRelease.hidden = false;
+        btnOpenRelease.textContent = '前往更新';
+        btnOpenRelease.onclick = () => openExternalUrl(logUrl);
+      }
+      break;
+    }
+
+    case 'latest': {
+      extensionUpdateStatus.textContent = localVersionText || 'v0.0.0';
+      extensionUpdateStatus.classList.add('is-version-label');
+      resetUpdateCard();
+      break;
+    }
+
+    case 'empty': {
+      extensionUpdateStatus.textContent = localVersionText || 'v0.0.0';
+      extensionUpdateStatus.classList.add('is-version-label');
+      resetUpdateCard();
+      break;
+    }
+
+    case 'error':
+    default: {
+      extensionUpdateStatus.textContent = localVersionText || 'v0.0.0';
+      extensionUpdateStatus.classList.add('is-version-label', 'is-check-failed');
+      extensionVersionMeta.textContent = snapshot?.errorMessage || 'GitHub Releases 检查失败';
+      extensionVersionMeta.hidden = false;
+      resetUpdateCard();
+      break;
+    }
+  }
+}
+
+async function initializeReleaseInfo() {
+  const fallbackReleaseUrl = sidepanelUpdateService?.releasesPageUrl || 'https://github.com/QLHazyCoder/codex-oauth-automation-extension/releases';
+
+  if (btnReleaseLog) {
+    btnReleaseLog.onclick = () => openExternalUrl(currentReleaseSnapshot?.logUrl || fallbackReleaseUrl);
+  }
+
+  if (!extensionUpdateStatus || !extensionVersionMeta) {
+    return;
+  }
+
+  const localVersion = sidepanelUpdateService?.stripVersionPrefix?.(chrome.runtime.getManifest()?.version || '') || '';
+  extensionUpdateStatus.textContent = localVersion ? `v${localVersion}` : 'v0.0.0';
+  extensionUpdateStatus.classList.remove('is-update-available', 'is-check-failed');
+  extensionUpdateStatus.classList.add('is-version-label');
+  extensionVersionMeta.hidden = true;
+  extensionVersionMeta.textContent = '';
+  if (btnReleaseLog) {
+    btnReleaseLog.hidden = true;
+  }
+  resetUpdateCard();
+
+  if (!sidepanelUpdateService) {
+    extensionVersionMeta.textContent = '更新检查服务不可用';
+    extensionVersionMeta.hidden = false;
+    return;
+  }
+
+  const snapshot = await sidepanelUpdateService.getReleaseSnapshot();
+  renderReleaseSnapshot(snapshot);
+}
+
 function syncPasswordField(state) {
   inputPassword.value = state.customPassword || state.password || '';
 }
@@ -1093,6 +1322,22 @@ function isCurrentEmailManagedByHotmail(state = latestState) {
   const inputEmailValue = String(inputEmail.value || '').trim();
   const stateEmailValue = String(state?.email || '').trim();
   return inputEmailValue === hotmailEmail || stateEmailValue === hotmailEmail;
+}
+
+function isCurrentEmailManagedByGeneratedAlias(provider = latestState?.mailProvider, state = latestState) {
+  const normalizedProvider = String(provider || '').trim();
+  if (!usesGeneratedAliasMailProvider(normalizedProvider)) {
+    return false;
+  }
+
+  const inputEmailValue = String(inputEmail.value || '').trim().toLowerCase();
+  const stateEmailValue = String(state?.email || '').trim().toLowerCase();
+
+  if (normalizedProvider === '2925') {
+    return inputEmailValue.endsWith('@2925.com') || stateEmailValue.endsWith('@2925.com');
+  }
+
+  return false;
 }
 
 function updateMailLoginButtonState() {
@@ -1310,10 +1555,13 @@ function renderHotmailAccounts() {
 }
 
 function updateMailProviderUI() {
+  const use2925 = selectMailProvider.value === '2925';
+  const useGeneratedAlias = usesGeneratedAliasMailProvider(selectMailProvider.value);
   const useInbucket = selectMailProvider.value === 'inbucket';
   const useHotmail = selectMailProvider.value === 'hotmail-api';
-  const useEmailGenerator = !useHotmail;
+  const useEmailGenerator = !useHotmail && !useGeneratedAlias;
   updateMailLoginButtonState();
+  rowEmailPrefix.style.display = useGeneratedAlias ? '' : 'none';
   rowInbucketHost.style.display = useInbucket ? '' : 'none';
   rowInbucketMailbox.style.display = useInbucket ? '' : 'none';
   const useCloudflare = selectEmailGenerator.value === 'cloudflare';
@@ -1332,18 +1580,23 @@ function updateMailProviderUI() {
   if (hotmailSection) {
     hotmailSection.style.display = useHotmail ? '' : 'none';
   }
-  selectEmailGenerator.disabled = useHotmail;
+  labelEmailPrefix.textContent = '邮箱前缀';
+  inputEmailPrefix.placeholder = '例如 abc';
+  selectEmailGenerator.disabled = useHotmail || useGeneratedAlias;
   btnFetchEmail.hidden = useHotmail;
-  inputEmail.readOnly = useHotmail;
+  inputEmail.readOnly = useHotmail || useGeneratedAlias;
   const uiCopy = getEmailGeneratorUiCopy();
-  inputEmail.placeholder = useHotmail ? '由 Hotmail 账号池自动分配' : uiCopy.placeholder;
+  inputEmail.placeholder = useHotmail
+    ? '由 Hotmail 账号池自动分配'
+    : (use2925 ? '步骤 3 自动生成 2925 邮箱并回填' : uiCopy.placeholder);
+  btnFetchEmail.disabled = useGeneratedAlias || isAutoRunLockedPhase();
   if (!btnFetchEmail.disabled) {
     btnFetchEmail.textContent = uiCopy.buttonLabel;
   }
   if (autoHintText) {
     autoHintText.textContent = useHotmail
       ? '请先校验并选择一个 Hotmail 账号'
-      : '先自动获取邮箱，或手动粘贴邮箱后再继续';
+      : (useGeneratedAlias ? '步骤 3 会自动生成邮箱，无需手动获取' : '先自动获取邮箱，或手动粘贴邮箱后再继续');
   }
   if (useHotmail) {
     inputEmail.value = getCurrentHotmailEmail();
@@ -1873,6 +2126,16 @@ document.querySelectorAll('.step-btn').forEach(btn => {
           if (response?.error) {
             throw new Error(response.error);
           }
+        } else if (usesGeneratedAliasMailProvider(selectMailProvider.value)) {
+          const emailPrefix = inputEmailPrefix.value.trim();
+          if (!emailPrefix) {
+            showToast('请先填写 2925 邮箱前缀。', 'warn');
+            return;
+          }
+          const response = await chrome.runtime.sendMessage({ type: 'EXECUTE_STEP', source: 'sidepanel', payload: { step, emailPrefix } });
+          if (response?.error) {
+            throw new Error(response.error);
+          }
         } else {
           let email = inputEmail.value.trim();
           if (!email) {
@@ -2395,7 +2658,13 @@ selectMailProvider.addEventListener('change', async () => {
   const previousProvider = latestState?.mailProvider || '';
   const nextProvider = selectMailProvider.value;
   updateMailProviderUI();
-  if (previousProvider === 'hotmail-api' && nextProvider !== 'hotmail-api' && isCurrentEmailManagedByHotmail()) {
+  const leavingHotmail = previousProvider === 'hotmail-api'
+    && nextProvider !== 'hotmail-api'
+    && isCurrentEmailManagedByHotmail();
+  const leavingGeneratedAlias = previousProvider !== nextProvider
+    && usesGeneratedAliasMailProvider(previousProvider)
+    && isCurrentEmailManagedByGeneratedAlias(previousProvider);
+  if (leavingHotmail || leavingGeneratedAlias) {
     await clearRegistrationEmail({ silent: true }).catch(() => { });
   }
   markSettingsDirty(true);
@@ -2481,6 +2750,14 @@ inputSub2ApiGroup.addEventListener('input', () => {
 });
 inputSub2ApiGroup.addEventListener('blur', () => {
   saveSettings({ silent: true }).catch(() => { });
+});
+
+inputEmailPrefix.addEventListener('input', () => {
+  markSettingsDirty(true);
+  scheduleSettingsAutoSave();
+});
+inputEmailPrefix.addEventListener('blur', () => {
+  saveSettings({ silent: true }).catch(() => {});
 });
 
 inputInbucketMailbox.addEventListener('input', () => {
@@ -2745,6 +3022,9 @@ initHotmailListExpandedState();
 updateSaveButtonState();
 updateConfigMenuControls();
 setLocalCpaStep9Mode(DEFAULT_LOCAL_CPA_STEP9_MODE);
+initializeReleaseInfo().catch((err) => {
+  console.error('Failed to initialize release info:', err);
+});
 restoreState().then(() => {
   syncPasswordToggleLabel();
   syncVpsUrlToggleLabel();

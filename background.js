@@ -83,6 +83,7 @@ const LEGACY_PERSISTED_SETTING_DEFAULTS = {
   cloudflareDomain: '', // 仅当 emailGenerator=cloudflare 时填写自定义域名。
   cloudflareDomains: [], // Cloudflare 可选域名列表。
   hotmailAccounts: [],
+  emailPrefix: '',
 };
 
 const PERSISTED_SETTING_DEFAULTS = {
@@ -250,6 +251,7 @@ function normalizeMailProvider(value = '') {
     case '163-vip':
     case 'qq':
     case 'inbucket':
+    case '2925':
       return normalized;
     default:
       return PERSISTED_SETTING_DEFAULTS.mailProvider;
@@ -319,6 +321,8 @@ function normalizePersistentSettingValue(key, value) {
       return normalizeMailProvider(value);
     case 'emailGenerator':
       return normalizeEmailGenerator(value);
+    case 'emailPrefix':
+      return String(value || '').trim();
     case 'inbucketHost':
       return String(value || '').trim();
     case 'inbucketMailbox':
@@ -462,10 +466,8 @@ async function importSettingsBundle(configBundle) {
   const sessionUpdates = {
     ...importedSettings,
     currentHotmailAccountId: null,
+    email: null,
   };
-  if (importedSettings.mailProvider === HOTMAIL_PROVIDER) {
-    sessionUpdates.email = null;
-  }
 
   await setState(sessionUpdates);
   broadcastDataUpdate({
@@ -1163,6 +1165,34 @@ async function pollHotmailVerificationCode(step, state, pollPayload = {}) {
   throw lastError || new Error(`步骤 ${step}：未在 Hotmail 收件箱中找到新的匹配验证码。`);
 }
 
+function generateRandomSuffix(length = 6) {
+  const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
+  let suffix = '';
+  for (let i = 0; i < length; i++) {
+    suffix += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return suffix;
+}
+
+function isGeneratedAliasProvider(provider) {
+  return provider === '2925';
+}
+
+function buildGeneratedAliasEmail(state) {
+  const provider = state.mailProvider || '163';
+  const emailPrefix = (state.emailPrefix || '').trim();
+
+  if (!emailPrefix) {
+    throw new Error('2925 邮箱前缀未设置，请先在侧边栏填写。');
+  }
+
+  if (provider === '2925') {
+    return `${emailPrefix}${generateRandomSuffix(6)}@2925.com`;
+  }
+
+  throw new Error(`未支持的别名邮箱类型：${provider}`);
+}
+
 // ============================================================
 // Tab Registry
 // ============================================================
@@ -1282,6 +1312,8 @@ function matchesSourceUrlFamily(source, candidateUrl, referenceUrl) {
       return Boolean(reference)
         && candidate.origin === reference.origin
         && candidate.pathname.startsWith('/m/');
+    case 'mail-2925':
+      return candidate.hostname === '2925.com' || candidate.hostname === 'www.2925.com';
     case 'vps-panel':
       return Boolean(reference)
         && candidate.origin === reference.origin
@@ -1979,6 +2011,7 @@ function getSourceLabel(source) {
     'sub2api-panel': 'SUB2API 后台',
     'qq-mail': 'QQ 邮箱',
     'mail-163': '163 邮箱',
+    'mail-2925': '2925 邮箱',
     'inbucket-mail': 'Inbucket 邮箱',
     'duck-mail': 'Duck 邮箱',
     'hotmail-api': 'Hotmail（微软 Graph）',
@@ -2688,6 +2721,10 @@ async function handleMessage(message, sender) {
       if (message.payload.email) {
         await setEmailState(message.payload.email);
       }
+      if (message.payload.emailPrefix !== undefined) {
+        await setPersistentSettings({ emailPrefix: message.payload.emailPrefix });
+        await setState({ emailPrefix: message.payload.emailPrefix });
+      }
       await executeStep(step);
       return { ok: true };
     }
@@ -3306,6 +3343,14 @@ async function ensureAutoEmailReady(targetRun, totalRuns, attemptRuns) {
     return account.email;
   }
 
+  if (isGeneratedAliasProvider(currentState.mailProvider)) {
+    if (!currentState.emailPrefix) {
+      throw new Error('2925 邮箱前缀未设置，请先在侧边栏填写。');
+    }
+    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：2925 模式已启用，将在步骤 3 自动生成邮箱（第 ${attemptRuns} 次尝试）===`, 'info');
+    return null;
+  }
+
   if (currentState.email) {
     return currentState.email;
   }
@@ -3496,6 +3541,7 @@ async function autoRunLoop(totalRuns, options = {}) {
         autoStepDelaySeconds: prevState.autoStepDelaySeconds,
         mailProvider: prevState.mailProvider,
         emailGenerator: prevState.emailGenerator,
+        emailPrefix: prevState.emailPrefix,
         inbucketHost: prevState.inbucketHost,
         inbucketMailbox: prevState.inbucketMailbox,
         cloudflareDomain: prevState.cloudflareDomain,
@@ -3831,6 +3877,8 @@ async function executeStep3(state) {
       preferredAccountId: state.currentHotmailAccountId || null,
     });
     resolvedEmail = account.email;
+  } else if (isGeneratedAliasProvider(state.mailProvider)) {
+    resolvedEmail = buildGeneratedAliasEmail(state);
   }
 
   if (!resolvedEmail) {
@@ -3890,6 +3938,15 @@ function getMailConfig(state) {
       navigateOnReuse: true,
       inject: ['content/activation-utils.js', 'content/utils.js', 'content/inbucket-mail.js'],
       injectSource: 'inbucket-mail',
+    };
+  }
+  if (provider === '2925') {
+    return {
+      source: 'mail-2925',
+      url: 'https://2925.com/#/mailList',
+      label: '2925 邮箱',
+      inject: ['content/utils.js', 'content/mail-2925.js'],
+      injectSource: 'mail-2925',
     };
   }
   return { source: 'qq-mail', url: 'https://wx.mail.qq.com/', label: 'QQ 邮箱' };
