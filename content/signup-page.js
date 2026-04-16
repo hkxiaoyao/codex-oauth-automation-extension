@@ -206,6 +206,15 @@ async function resendVerificationCode(step, timeout = 45000) {
 
   while (Date.now() - start < timeout) {
     throwIfStopped();
+
+    // Check for 405 error page and recover by clicking "Try again"
+    if (is405MethodNotAllowedPage()) {
+      await handle405ResendError(step, timeout - (Date.now() - start));
+      // After recovery, loop back to find the resend button again
+      loggedWaiting = false;
+      continue;
+    }
+
     action = findResendVerificationCodeTrigger({ allowDisabled: true });
 
     if (action && isActionEnabled(action)) {
@@ -213,6 +222,15 @@ async function resendVerificationCode(step, timeout = 45000) {
       await humanPause(350, 900);
       simulateClick(action);
       await sleep(1200);
+
+      // After clicking resend, check if 405 error appeared
+      if (is405MethodNotAllowedPage()) {
+        log(`步骤 ${step}：点击重新发送后出现 405 错误，正在恢复...`, 'warn');
+        await handle405ResendError(step, timeout - (Date.now() - start));
+        loggedWaiting = false;
+        continue;
+      }
+
       return {
         resent: true,
         buttonText: getActionText(action),
@@ -228,6 +246,43 @@ async function resendVerificationCode(step, timeout = 45000) {
   }
 
   throw new Error('无法点击重新发送验证码按钮。URL: ' + location.href);
+}
+
+function is405MethodNotAllowedPage() {
+  const pageText = document.body?.textContent || '';
+  return /405\s+Method\s+Not\s+Allowed/i.test(pageText)
+    || /Route\s+Error.*405/i.test(pageText);
+}
+
+async function handle405ResendError(step, remainingTimeout = 30000) {
+  const start = Date.now();
+  let retryCount = 0;
+
+  while (Date.now() - start < remainingTimeout) {
+    throwIfStopped();
+
+    if (!is405MethodNotAllowedPage()) {
+      // Page recovered — back to verification page
+      log(`步骤 ${step}：405 错误已恢复，页面已返回验证码页面。`);
+      return;
+    }
+
+    const retryBtn = getAuthRetryButton();
+    if (retryBtn) {
+      retryCount++;
+      log(`步骤 ${step}：检测到 405 错误页面，正在点击"Try again"（第 ${retryCount} 次）...`, 'warn');
+      await humanPause(300, 800);
+      simulateClick(retryBtn);
+
+      // Wait 3 seconds before checking again
+      await sleep(3000);
+      continue;
+    }
+
+    await sleep(500);
+  }
+
+  throw new Error(`步骤 ${step}：405 错误恢复超时，无法返回验证码页面。URL: ${location.href}`);
 }
 
 // ============================================================
@@ -720,38 +775,6 @@ function getStep5ErrorText() {
   return messages.find((text) => STEP5_SUBMIT_ERROR_PATTERN.test(text)) || '';
 }
 
-async function waitForStep5SubmitOutcome(timeout = 15000) {
-  const start = Date.now();
-
-  while (Date.now() - start < timeout) {
-    throwIfStopped();
-
-    const errorText = getStep5ErrorText();
-    if (errorText) {
-      return { invalidProfile: true, errorText };
-    }
-
-    if (isAddPhonePageReady()) {
-      return { success: true, addPhonePage: true };
-    }
-
-    if (isStep8Ready()) {
-      return { success: true };
-    }
-
-    await sleep(150);
-  }
-
-  const errorText = getStep5ErrorText();
-  if (errorText) {
-    return { invalidProfile: true, errorText };
-  }
-
-  return {
-    invalidProfile: true,
-    errorText: '提交后未进入下一阶段，请检查生日是否真正被页面接受。',
-  };
-}
 
 function isSignupPasswordPage() {
   return /\/create-account\/password(?:[/?#]|$)/i.test(location.pathname || '');
@@ -913,13 +936,6 @@ function inspectLoginAuthState() {
     };
   }
 
-  if (oauthConsentPage) {
-    return {
-      ...baseState,
-      state: 'oauth_consent_page',
-    };
-  }
-
   if (passwordInput || switchTrigger) {
     return {
       ...baseState,
@@ -965,7 +981,8 @@ function serializeLoginAuthState(snapshot) {
 }
 
 function getLoginAuthStateLabel(snapshot) {
-  switch (snapshot?.state) {
+  const state = snapshot?.state === 'oauth_consent_page' ? 'unknown' : snapshot?.state;
+  switch (state) {
     case 'verification_page':
       return '登录验证码页';
     case 'password_page':
@@ -985,11 +1002,11 @@ function getLoginAuthStateLabel(snapshot) {
 
 async function waitForKnownLoginAuthState(timeout = 15000) {
   const start = Date.now();
-  let snapshot = inspectLoginAuthState();
+  let snapshot = normalizeStep6Snapshot(inspectLoginAuthState());
 
   while (Date.now() - start < timeout) {
     throwIfStopped();
-    snapshot = inspectLoginAuthState();
+    snapshot = normalizeStep6Snapshot(inspectLoginAuthState());
     if (snapshot.state !== 'unknown') {
       return snapshot;
     }
@@ -1041,7 +1058,19 @@ function createStep6RecoverableResult(reason, snapshot, options = {}) {
   };
 }
 
+function normalizeStep6Snapshot(snapshot) {
+  if (snapshot?.state !== 'oauth_consent_page') {
+    return snapshot;
+  }
+
+  return {
+    ...snapshot,
+    state: 'unknown',
+  };
+}
+
 function throwForStep6FatalState(snapshot) {
+  snapshot = normalizeStep6Snapshot(snapshot);
   switch (snapshot?.state) {
     case 'oauth_consent_page':
       throw new Error(`当前页面已进入 OAuth 授权页，未经过登录验证码页，无法完成步骤 6。URL: ${snapshot.url}`);
@@ -1258,28 +1287,55 @@ async function fillVerificationCode(step, payload) {
   }
 
   // Find code input — could be a single input or multiple separate inputs
+  // Retry with 405 error recovery if needed
+  const maxRetries = 3;
   let codeInput = null;
-  try {
-    codeInput = await waitForElement(VERIFICATION_CODE_INPUT_SELECTOR, 10000);
-  } catch {
-    // Check for multiple single-digit inputs (common pattern)
-    const singleInputs = document.querySelectorAll('input[maxlength="1"]');
-    if (singleInputs.length >= 6) {
-      log(`步骤 ${step}：发现分开的单字符验证码输入框，正在逐个填写...`);
-      for (let i = 0; i < 6 && i < singleInputs.length; i++) {
-        fillInput(singleInputs[i], code[i]);
-        await sleep(100);
-      }
-      const outcome = await waitForVerificationSubmitOutcome(step);
-      if (outcome.invalidCode) {
-        log(`步骤 ${step}：验证码被拒绝：${outcome.errorText}`, 'warn');
-      } else if (outcome.addPhonePage) {
-        log(`步骤 ${step}：验证码已通过，并已跳转到手机号页面。`, 'ok');
-      } else {
-        log(`步骤 ${step}：验证码已通过${outcome.assumed ? '（按成功推定）' : ''}。`, 'ok');
-      }
-      return outcome;
+
+  for (let retry = 0; retry <= maxRetries; retry++) {
+    throwIfStopped();
+
+    // Before looking for input, check if page is in 405 error state
+    if (is405MethodNotAllowedPage()) {
+      log(`步骤 ${step}：检测到 405 错误页面，正在恢复...`, 'warn');
+      await handle405ResendError(step, 30000);
+      continue;
     }
+
+    try {
+      codeInput = await waitForElement(VERIFICATION_CODE_INPUT_SELECTOR, 10000);
+      break; // Found it
+    } catch {
+      // Check for multiple single-digit inputs (common pattern)
+      const singleInputs = document.querySelectorAll('input[maxlength="1"]');
+      if (singleInputs.length >= 6) {
+        log(`步骤 ${step}：发现分开的单字符验证码输入框，正在逐个填写...`);
+        for (let i = 0; i < 6 && i < singleInputs.length; i++) {
+          fillInput(singleInputs[i], code[i]);
+          await sleep(100);
+        }
+        const outcome = await waitForVerificationSubmitOutcome(step);
+        if (outcome.invalidCode) {
+          log(`步骤 ${step}：验证码被拒绝：${outcome.errorText}`, 'warn');
+        } else if (outcome.addPhonePage) {
+          log(`步骤 ${step}：验证码已通过，并已跳转到手机号页面。`, 'ok');
+        } else {
+          log(`步骤 ${step}：验证码已通过${outcome.assumed ? '（按成功推定）' : ''}。`, 'ok');
+        }
+        return outcome;
+      }
+
+      // No input found — check if it's a 405 error and can be recovered
+      if (is405MethodNotAllowedPage() && retry < maxRetries) {
+        log(`步骤 ${step}：未找到验证码输入框且页面出现 405 错误，正在恢复...`, 'warn');
+        await handle405ResendError(step, 30000);
+        continue;
+      }
+
+      throw new Error('未找到验证码输入框。URL: ' + location.href);
+    }
+  }
+
+  if (!codeInput) {
     throw new Error('未找到验证码输入框。URL: ' + location.href);
   }
 
@@ -1317,11 +1373,11 @@ async function fillVerificationCode(step, payload) {
 
 async function waitForStep6EmailSubmitTransition(emailSubmittedAt, timeout = 12000) {
   const start = Date.now();
-  let snapshot = inspectLoginAuthState();
+  let snapshot = normalizeStep6Snapshot(inspectLoginAuthState());
 
   while (Date.now() - start < timeout) {
     throwIfStopped();
-    snapshot = inspectLoginAuthState();
+    snapshot = normalizeStep6Snapshot(inspectLoginAuthState());
 
     if (snapshot.state === 'verification_page') {
       return {
@@ -1357,7 +1413,7 @@ async function waitForStep6EmailSubmitTransition(emailSubmittedAt, timeout = 120
     await sleep(250);
   }
 
-  snapshot = inspectLoginAuthState();
+  snapshot = normalizeStep6Snapshot(inspectLoginAuthState());
   if (snapshot.state === 'verification_page') {
     return {
       action: 'done',
@@ -1395,11 +1451,11 @@ async function waitForStep6EmailSubmitTransition(emailSubmittedAt, timeout = 120
 
 async function waitForStep6PasswordSubmitTransition(passwordSubmittedAt, timeout = 10000) {
   const start = Date.now();
-  let snapshot = inspectLoginAuthState();
+  let snapshot = normalizeStep6Snapshot(inspectLoginAuthState());
 
   while (Date.now() - start < timeout) {
     throwIfStopped();
-    snapshot = inspectLoginAuthState();
+    snapshot = normalizeStep6Snapshot(inspectLoginAuthState());
 
     if (snapshot.state === 'verification_page') {
       return {
@@ -1431,7 +1487,7 @@ async function waitForStep6PasswordSubmitTransition(passwordSubmittedAt, timeout
     await sleep(250);
   }
 
-  snapshot = inspectLoginAuthState();
+  snapshot = normalizeStep6Snapshot(inspectLoginAuthState());
   if (snapshot.state === 'verification_page') {
     return {
       action: 'done',
@@ -1469,11 +1525,11 @@ async function waitForStep6PasswordSubmitTransition(passwordSubmittedAt, timeout
 
 async function waitForStep6SwitchTransition(loginVerificationRequestedAt, timeout = 10000) {
   const start = Date.now();
-  let snapshot = inspectLoginAuthState();
+  let snapshot = normalizeStep6Snapshot(inspectLoginAuthState());
 
   while (Date.now() - start < timeout) {
     throwIfStopped();
-    snapshot = inspectLoginAuthState();
+    snapshot = normalizeStep6Snapshot(inspectLoginAuthState());
 
     if (snapshot.state === 'verification_page') {
       return createStep6SuccessResult(snapshot, {
@@ -1499,7 +1555,7 @@ async function waitForStep6SwitchTransition(loginVerificationRequestedAt, timeou
     await sleep(250);
   }
 
-  snapshot = inspectLoginAuthState();
+  snapshot = normalizeStep6Snapshot(inspectLoginAuthState());
   if (snapshot.state === 'verification_page') {
     return createStep6SuccessResult(snapshot, {
       via: 'switch_to_one_time_code_login',
@@ -1526,7 +1582,7 @@ async function waitForStep6SwitchTransition(loginVerificationRequestedAt, timeou
 async function step6SwitchToOneTimeCodeLogin(snapshot) {
   const switchTrigger = snapshot?.switchTrigger || findOneTimeCodeLoginTrigger();
   if (!switchTrigger || !isActionEnabled(switchTrigger)) {
-    return createStep6RecoverableResult('missing_one_time_code_trigger', inspectLoginAuthState(), {
+    return createStep6RecoverableResult('missing_one_time_code_trigger', normalizeStep6Snapshot(inspectLoginAuthState()), {
       message: '当前登录页没有可用的一次性验证码登录入口。',
     });
   }
@@ -1541,7 +1597,7 @@ async function step6SwitchToOneTimeCodeLogin(snapshot) {
 }
 
 async function step6LoginFromPasswordPage(payload, snapshot) {
-  const currentSnapshot = snapshot || inspectLoginAuthState();
+  const currentSnapshot = normalizeStep6Snapshot(snapshot || inspectLoginAuthState());
 
   if (currentSnapshot.passwordInput) {
     if (!payload.password) {
@@ -1571,7 +1627,7 @@ async function step6LoginFromPasswordPage(payload, snapshot) {
       return step6SwitchToOneTimeCodeLogin(transition.snapshot);
     }
 
-    return createStep6RecoverableResult('password_submit_unknown', inspectLoginAuthState(), {
+    return createStep6RecoverableResult('password_submit_unknown', normalizeStep6Snapshot(inspectLoginAuthState()), {
       message: '提交密码后未得到可用的下一步状态。',
     });
   }
@@ -1586,7 +1642,7 @@ async function step6LoginFromPasswordPage(payload, snapshot) {
 }
 
 async function step6LoginFromEmailPage(payload, snapshot) {
-  const currentSnapshot = snapshot || inspectLoginAuthState();
+  const currentSnapshot = normalizeStep6Snapshot(snapshot || inspectLoginAuthState());
   const emailInput = currentSnapshot.emailInput || getLoginEmailInput();
   if (!emailInput) {
     throw new Error('在登录页未找到邮箱输入框。URL: ' + location.href);
@@ -1618,7 +1674,7 @@ async function step6LoginFromEmailPage(payload, snapshot) {
     return step6LoginFromPasswordPage(payload, transition.snapshot);
   }
 
-  return createStep6RecoverableResult('email_submit_unknown', inspectLoginAuthState(), {
+  return createStep6RecoverableResult('email_submit_unknown', normalizeStep6Snapshot(inspectLoginAuthState()), {
     message: '提交邮箱后未得到可用的下一步状态。',
   });
 }
@@ -1629,7 +1685,7 @@ async function step6_login(payload) {
 
   log(`步骤 6：正在使用 ${email} 登录...`);
 
-  const snapshot = await waitForKnownLoginAuthState(15000);
+  const snapshot = normalizeStep6Snapshot(await waitForKnownLoginAuthState(15000));
 
   if (snapshot.state === 'verification_page') {
     log('步骤 6：登录验证码页面已就绪。', 'ok');
@@ -1839,6 +1895,17 @@ function getSerializableRect(el) {
 // Step 5: Fill Name & Birthday / Age
 // ============================================================
 
+function getStep5DirectCompletionPayload({ isAgeMode = false } = {}) {
+  const payload = {
+    skippedPostSubmitCheck: true,
+    directProceedToStep6: true,
+  };
+  if (isAgeMode) {
+    payload.ageMode = true;
+  }
+  return payload;
+}
+
 async function step5_fillNameBirthday(payload) {
   const { firstName, lastName, age, year, month, day } = payload;
   if (!firstName || !lastName) throw new Error('未提供姓名数据。');
@@ -2009,6 +2076,41 @@ async function step5_fillNameBirthday(payload) {
   } else {
     throw new Error('未找到生日或年龄输入项。URL: ' + location.href);
   }
+  // 韩国IP判断勾选框""I agree"
+  const allConsentCheckbox = Array.from(document.querySelectorAll('input[name="allCheckboxes"][type="checkbox"]'))
+    .find((el) => {
+      const checkboxLabel = el.closest('label');
+      const labelText = normalizeInlineText(checkboxLabel?.textContent || '');
+      return (!checkboxLabel || isVisibleElement(checkboxLabel))
+        && /I\s+agree\s+to\s+all\s+of\s+the\s+following/i.test(labelText);
+    }) || null;
+
+  if (allConsentCheckbox) {
+    if (!allConsentCheckbox.checked) {
+      const checkboxLabel = allConsentCheckbox.closest('label');
+      await humanPause(500, 1500);
+      if (checkboxLabel && isVisibleElement(checkboxLabel)) {
+        simulateClick(checkboxLabel);
+      } else {
+        simulateClick(allConsentCheckbox);
+      }
+      await sleep(250);
+
+      if (!allConsentCheckbox.checked) {
+        allConsentCheckbox.click();
+        await sleep(250);
+      }
+
+      if (!allConsentCheckbox.checked) {
+        throw new Error('未能勾选 “I agree to all of the following” 复选框。');
+      }
+
+      log('步骤 5：已勾选 “I agree to all of the following”。');
+    } else {
+      log('步骤 5：“I agree to all of the following” 已勾选，跳过。');
+    }
+  }
+
 
   // Click "完成帐户创建" button
   await sleep(500);
@@ -2020,28 +2122,21 @@ async function step5_fillNameBirthday(payload) {
 
   const isAgeMode = !birthdayMode && Boolean(ageInput);
   if (isAgeMode) {
-    log('步骤 5：当前为年龄输入模式，点击“继续”后将直接视为完成并进入步骤 6。', 'warn');
-    reportComplete(5, {
-      skippedPostSubmitCheck: true,
-      directProceedToStep6: true,
-    });
+    log('步骤 5：当前为年龄输入模式，点击“完成帐户创建”后将直接完成当前步骤。', 'warn');
   }
 
   await humanPause(500, 1300);
   simulateClick(completeBtn);
 
+  const completionPayload = getStep5DirectCompletionPayload({ isAgeMode });
+  reportComplete(5, completionPayload);
+
   if (isAgeMode) {
-    log('步骤 5：年龄模式已点击“继续”，已跳过后续结果等待。', 'warn');
-    return;
+    log('步骤 5：年龄模式已点击“完成帐户创建”，当前步骤直接完成，不再等待页面结果。', 'warn');
+    return completionPayload;
   }
 
-  log('步骤 5：已点击“完成帐户创建”，正在等待页面结果...');
-
-  const outcome = await waitForStep5SubmitOutcome();
-  if (outcome.invalidProfile) {
-    throw new Error(`步骤 5：${outcome.errorText}`);
-  }
-
-  log(`步骤 5：资料已通过。`, 'ok');
-  reportComplete(5, { addPhonePage: Boolean(outcome.addPhonePage) });
+  log('步骤 5：已点击“完成帐户创建”，当前步骤直接完成，不再等待页面结果。');
+  return completionPayload;
 }
+
